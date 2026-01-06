@@ -234,7 +234,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # 1. 增加 rep_dim (128 -> 512): 提高投影维度，使预测任务变难，让模型更难泛化到异常样本。
 # 2. 减小 hidden_dims ('100,50' -> '64,32'): 降低网络容量，防止模型“死记硬背”或过度泛化。
 # 3. 保持 epochs=300, lr=0.0001
-clf = RDP(device=device, epochs=300, lr=0.0001, rep_dim=512, hidden_dims='64,32')
+clf = RDP(device=device, epochs=300, lr=0.0001, rep_dim=1024, hidden_dims='256,128')
 clf.fit(Train_data, y=None)
 
 # 定义故障类型映射：ID -> (名称, 数据获取函数)
@@ -442,4 +442,127 @@ print(f"Metrics summary saved to {csv_path}")
 
 print("All plots generated successfully.")
 
+import numpy as np
+import torch
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+from xgboost import XGBClassifier
 
+def extract_features(clf, data_numpy):
+    """
+    使用训练好的 RDP 模型提取数据特征
+    """
+    # 1. 切换到评估模式
+    clf.net.eval()
+    
+    # 2. 转换为 Tensor 并移动到 GPU/CPU
+    data_tensor = torch.from_numpy(data_numpy).float().to(clf.device)
+    
+    # 3. 提取特征 (不进行梯度计算)
+    with torch.no_grad():
+        # net(x) 返回的是投影前的特征表示 (Representation)
+        features = clf.net(data_tensor)
+        
+    return features.cpu().numpy()
+
+def prepare_multiclass_data(fault_map):
+    """
+    收集所有故障数据，制作多分类数据集
+    Label 0: 正常
+    Label 1-7: 对应故障类型
+    """
+    all_features = []
+    all_labels = []
+    
+    # 1. 先收集一些正常数据 (从 Fault 1 的加载函数里借用正常样本)
+    # Get_test_data_1 返回 (数据, 0/1标签)，我们只要标签为0的部分
+    data, labels = fault_map[1][1](test_num=1400) # 这里只是借用函数加载
+    normal_data = data[labels == 0]
+    
+    # 将正常数据标记为 0
+    all_features.append(normal_data)
+    all_labels.append(np.zeros(len(normal_data)))
+    
+    print(f"Collected Normal samples: {len(normal_data)}")
+
+    # 2. 收集各种故障数据
+    for fid, (fname, get_data_func) in fault_map.items():
+        # 加载数据
+        data, labels = get_data_func(test_num=1400)
+        
+        # 只取故障部分 (labels == 1 的部分)
+        fault_data = data[labels == 1]
+        
+        # 将其标记为对应的 fid (1, 2, 3...)
+        all_features.append(fault_data)
+        all_labels.append(np.full(len(fault_data), fid))
+        
+        print(f"Collected Fault {fid} ({fname}) samples: {len(fault_data)}")
+
+    # 3. 合并所有数据
+    X_raw = np.vstack(all_features)
+    y = np.concatenate(all_labels)
+    
+    return X_raw, y
+
+def train_fault_classifier(clf, fault_map):
+    """
+    主函数：执行特征提取 + 故障分类训练
+    """
+    print("\n" + "="*30)
+    print("开始故障分类任务 (Fault Classification)")
+    print("="*30)
+
+    # 1. 准备原始数据
+    print("Step 1: 准备数据...")
+    X_raw, y = prepare_multiclass_data(fault_map)
+    
+    # 2. 特征提取 (关键步骤！)
+    print("Step 2: 使用 RDP 模型提取深层特征...")
+    # 这里我们把原始振动数据 (201维) 变成了 RDP 认为重要的特征 (比如 64维或32维)
+    X_features = extract_features(clf, X_raw)
+    
+    # 3. 划分训练集和测试集
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_features, y, test_size=0.3, random_state=42, stratify=y
+    )
+    
+    # 4. 训练分类器 
+    print("Step 3: 训练 XGBoost 分类器 ...")
+    
+    # 这里的参数是专门为了多分类优化的
+    classifier = XGBClassifier(
+        n_estimators=200,       # 树的数量，越多越准（但也越慢）
+        learning_rate=0.1,      # 学习率，越小越稳
+        max_depth=6,            # 树的深度，越深越能拟合复杂特征
+        objective='multi:softmax', # 指定是多分类任务
+        num_class=8,            # 类别数量 (0-7 共8类)
+        n_jobs=-1,              #以此使用所有CPU核心加速
+        random_state=42
+    )
+    
+    classifier.fit(X_train, y_train)
+    
+    # 5. 评估结果
+    print("Step 4: 评估分类效果...")
+    y_pred = classifier.predict(X_test)
+    
+    # 打印详细报告
+    target_names = ['Normal'] + [fault_map[i][0] for i in range(1, 8)]
+    print("\n分类报告:")
+    print(classification_report(y_test, y_pred, target_names=target_names))
+    
+    # 6. 画混淆矩阵图
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=target_names, yticklabels=target_names)
+    plt.title('Fault Classification Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.savefig('result/fault_classification_matrix.png')
+    print("混淆矩阵已保存至 result/fault_classification_matrix.png")
+train_fault_classifier(clf, fault_map)
